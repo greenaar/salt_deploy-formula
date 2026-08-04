@@ -1,0 +1,67 @@
+salt_deploy:
+  packages:
+    - git
+    - openssh-client
+    - sudo
+    - tar
+
+  deploy:
+    repository_url: ''
+    branch: main
+    base_dir: /srv/salt-deploy
+    mirror_dir: /srv/salt-deploy/repo.git
+    releases_dir: /srv/salt-deploy/releases
+    current_link: /srv/salt-deploy/current
+    script: /usr/local/sbin/deploy-salt
+    lock_file: /run/lock/deploy-salt.lock
+    config_dir: /etc/salt-deploy
+    private_key_path: /etc/salt-deploy/repository-deploy-key
+    private_key_pillar: salt_deploy:deploy:private_key
+    known_hosts_path: /etc/salt-deploy/known_hosts
+    known_hosts_pillar: salt_deploy:deploy:known_hosts
+    validation_command: test -f top.sls
+    retain_releases: 5
+    bootstrap: true
+    post_deploy:
+      sync_all: false
+      states: []
+
+  master:
+    manage_file_roots: true
+    config_file: /etc/salt/master.d/99-salt-deploy.conf
+    service: salt-master
+    saltenv: base
+
+  runner:
+    provider: github
+    user: salt-deploy-runner
+    group: salt-deploy-runner
+    home: /var/lib/salt-deploy-runner
+    install_dir: /opt/actions-runner
+    work_dir: /var/lib/salt-deploy-runner/_work
+    name: ''
+    github:
+      repository_url: ''
+      registration_token: ''
+      labels:
+        - salt-deploy
+      runner_group: ''
+      replace: false
+      version: 2.336.0
+      source_hashes:
+        x64: sha256=04cf0be1aff4c3ec3554466c39124ca250e3effd8873bb7e8d68535aa9505d5d
+        arm64: sha256=58b758e420b87093fbd4bfddd368074960053e2f1388f01848c82624b90f27d1
+    forgejo:
+      instance_url: ''
+      uuid: ''
+      token: ''
+      connection_name: salt-deploy
+      labels:
+        - salt-deploy:host
+      binary: /usr/local/bin/forgejo-runner
+      config_file: /etc/forgejo-runner/config.yml
+      service: forgejo-runner
+      version: 12.7.3
+      source_hashes:
+        amd64: ''
+        arm64: ''

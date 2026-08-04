@@ -1,0 +1,167 @@
+#!/usr/bin/env bash
+{% set post_deploy = deploy.get('post_deploy', {}) %}
+{% set post_states = post_deploy.get('states', []) %}
+{% if post_states is string or post_states is not iterable %}
+{{ raise('salt_deploy:deploy:post_deploy:states must be a list of SLS names') }}
+{% endif %}
+{% for state_name in post_states %}
+{% if state_name is not string or not state_name %}
+{{ raise('salt_deploy:deploy:post_deploy:states entries must be non-empty strings') }}
+{% endif %}
+{% endfor %}
+set -Eeuo pipefail
+umask 022
+
+readonly REPOSITORY_URL={{ deploy.repository_url | json }}
+readonly BRANCH={{ deploy.branch | json }}
+readonly BASE={{ deploy.base_dir | json }}
+readonly MIRROR={{ deploy.mirror_dir | json }}
+readonly RELEASES={{ deploy.releases_dir | json }}
+readonly CURRENT={{ deploy.current_link | json }}
+readonly LOCK_FILE={{ deploy.lock_file | json }}
+readonly PRIVATE_KEY={{ deploy.private_key_path | json }}
+readonly KNOWN_HOSTS={{ deploy.known_hosts_path | json }}
+readonly VALIDATION_COMMAND={{ deploy.validation_command | json }}
+readonly RETAIN_RELEASES={{ deploy.retain_releases | int }}
+readonly SALTENV={{ master.saltenv | json }}
+readonly POST_DEPLOY_SYNC_ALL={{ post_deploy.get('sync_all', false) | json }}
+readonly -a POST_DEPLOY_STATES=(
+{% for state_name in post_states %}
+    {{ state_name | json }}
+{% endfor %}
+)
+
+usage() {
+    echo "usage: $0 COMMIT_SHA | --latest" >&2
+    exit 64
+}
+
+[[ $# -eq 1 ]] || usage
+requested=$1
+
+exec 9>"$LOCK_FILE"
+flock -n 9 || {
+    echo "Another Salt deployment is running" >&2
+    exit 75
+}
+
+export GIT_SSH_COMMAND="/usr/bin/ssh -i $PRIVATE_KEY -o IdentitiesOnly=yes -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes"
+
+mkdir -p -- "$BASE" "$RELEASES"
+
+if [[ ! -d "$MIRROR" ]]; then
+    git clone --quiet --mirror "$REPOSITORY_URL" "$MIRROR"
+else
+    git --git-dir="$MIRROR" remote set-url origin "$REPOSITORY_URL"
+fi
+
+git --git-dir="$MIRROR" fetch --quiet --force origin \
+    "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH"
+
+remote_sha=$(git --git-dir="$MIRROR" rev-parse "refs/remotes/origin/$BRANCH")
+
+if [[ "$requested" == "--latest" ]]; then
+    sha=$remote_sha
+elif [[ "$requested" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]]; then
+    sha=$requested
+else
+    usage
+fi
+
+if [[ "$sha" != "$remote_sha" ]]; then
+    echo "Requested $sha, but origin/$BRANCH is now $remote_sha" >&2
+    exit 65
+fi
+
+release="$RELEASES/$sha"
+
+if [[ ! -d "$release" ]]; then
+    staging=$(mktemp -d "$RELEASES/.staging.XXXXXXXX")
+
+    cleanup() {
+        rm -rf -- "$staging"
+    }
+    trap cleanup EXIT
+
+    git --git-dir="$MIRROR" archive "$sha" | tar -x --directory="$staging"
+
+    if [[ -n "$VALIDATION_COMMAND" ]]; then
+        (cd "$staging" && /bin/bash -o pipefail -c "$VALIDATION_COMMAND")
+    fi
+
+    mv -- "$staging" "$release"
+    trap - EXIT
+fi
+
+previous_target=''
+if [[ -L "$CURRENT" ]]; then
+    previous_target=$(readlink "$CURRENT")
+elif [[ -e "$CURRENT" ]]; then
+    echo "$CURRENT exists and is not a symbolic link" >&2
+    exit 73
+fi
+
+new_link="$BASE/.current.$sha"
+rm -f -- "$new_link"
+ln -s "releases/$sha" "$new_link"
+mv -Tf -- "$new_link" "$CURRENT"
+
+if ! salt-run fileserver.clear_file_list_cache backend=roots; then
+    echo "Salt cache refresh failed; restoring the previous release" >&2
+    if [[ -n "$previous_target" ]]; then
+        rollback_link="$BASE/.current.rollback.$$"
+        ln -s "$previous_target" "$rollback_link"
+        mv -Tf -- "$rollback_link" "$CURRENT"
+        salt-run fileserver.clear_file_list_cache backend=roots || true
+    else
+        rm -f -- "$CURRENT"
+    fi
+    exit 70
+fi
+
+post_deploy_failure() {
+    echo "Post-deployment actions failed for $sha; the promoted release remains active" >&2
+    logger -t salt-deploy "Post-deployment actions failed for Salt release $sha; release remains active"
+    exit 70
+}
+
+# The initial promotion can be running inside state.apply salt_deploy. Starting
+# another local state run there would contend with the active state lock, so
+# hooks intentionally begin with the next deployment.
+if [[ -n "$previous_target" ]]; then
+    if [[ "$POST_DEPLOY_SYNC_ALL" == true ]]; then
+        echo "Synchronizing Salt master extension modules"
+        salt-run saltutil.sync_all saltenv="$SALTENV" || post_deploy_failure
+    fi
+
+    for state_name in "${POST_DEPLOY_STATES[@]}"; do
+        echo "Applying master state: $state_name"
+        salt-call state.apply "$state_name" saltenv="$SALTENV" || post_deploy_failure
+    done
+elif [[ "$POST_DEPLOY_SYNC_ALL" == true || ${#POST_DEPLOY_STATES[@]} -gt 0 ]]; then
+    echo "Skipping post-deployment actions during initial bootstrap"
+fi
+
+if (( RETAIN_RELEASES > 0 )); then
+    mapfile -d '' candidates < <(
+        find "$RELEASES" -mindepth 1 -maxdepth 1 -type d \
+            ! -name '.staging.*' -printf '%T@\t%p\0' | sort -zrn
+    )
+
+    retained=0
+    current_real=$(readlink -f "$CURRENT")
+    for candidate_record in "${candidates[@]}"; do
+        candidate=${candidate_record#*$'\t'}
+        if (( retained < RETAIN_RELEASES )) || [[ "$candidate" == "$current_real" ]]; then
+            ((retained += 1))
+            continue
+        fi
+        case "$candidate" in
+            "$RELEASES"/*) rm -rf -- "$candidate" ;;
+            *) echo "Refusing to prune unexpected path: $candidate" >&2; exit 70 ;;
+        esac
+    done
+fi
+
+logger -t salt-deploy "Promoted Salt release $sha"
+echo "Promoted Salt release $sha"

@@ -1,0 +1,17 @@
+name: Deploy Salt states
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: salt-deploy
+    timeout-minutes: 10
+
+    steps:
+      - name: Promote pushed revision
+        env:
+          DEPLOY_SHA: ${{ forgejo.sha }}
+        run: sudo /usr/local/sbin/deploy-salt "$DEPLOY_SHA"

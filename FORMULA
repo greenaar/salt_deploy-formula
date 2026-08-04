@@ -1,0 +1,9 @@
+name: salt_deploy
+os: Debian, Raspbian, Ubuntu
+os_family: Debian
+version: 1.0.0
+release: 1
+minimum_version: 3006
+summary: 'salt_deploy formula'
+description: 'Installs either a repository-scoped GitHub Actions runner or a Forgejo Actions runner and promotes a remotely hosted Salt state tree into an entirely local file_roots directory. The forge is used only during deployment. An outage, failed fetch, invalid state tree, or interrupted checkout leaves the last'
+top_level_dir: salt_deploy

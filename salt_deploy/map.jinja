@@ -1,0 +1,31 @@
+{#- Configuration map for the salt_deploy formula. #}
+{% import_yaml 'salt_deploy/defaults.yml' as defaults %}
+
+{% set salt_deploy = salt['slsutil.merge'](
+  defaults.salt_deploy,
+  salt['pillar.get']('salt_deploy', {}),
+  strategy='recurse',
+  merge_lists=False,
+) %}
+
+{% set machine = salt['grains.get']('osarch', salt['grains.get']('cpuarch', 'x86_64')) %}
+{% set runner_arch = {
+  'x86_64': 'x64',
+  'amd64': 'x64',
+  'aarch64': 'arm64',
+  'arm64': 'arm64',
+}.get(machine, '') %}
+
+{% set forgejo_arch = {
+  'x86_64': 'amd64',
+  'amd64': 'amd64',
+  'aarch64': 'arm64',
+  'arm64': 'arm64',
+}.get(machine, '') %}
+
+{% if not salt_deploy.runner.name %}
+  {% do salt_deploy.runner.update({'name': salt['grains.get']('id', 'salt-master')}) %}
+{% endif %}
+
+{% do salt_deploy.runner.update({'arch': runner_arch}) %}
+{% do salt_deploy.runner.forgejo.update({'arch': forgejo_arch}) %}

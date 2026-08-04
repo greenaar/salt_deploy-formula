@@ -1,0 +1,24 @@
+[Unit]
+Description=Forgejo Actions runner for Salt deployments
+Documentation=https://forgejo.org/docs/latest/admin/actions/
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User={{ runner.user }}
+Group={{ runner.group }}
+WorkingDirectory={{ runner.home }}
+ExecStart={{ forgejo.binary }} daemon -c {{ forgejo.config_file }}
+Restart=always
+RestartSec=5s
+
+# Host jobs are needed for the fixed sudo deployment command. Restrict the
+# paths the otherwise untrusted workflow process can modify.
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths={{ runner.home }} {{ runner.work_dir }} {{ deploy.base_dir }} /var/cache/salt /var/log/salt /run/lock
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,24 @@
+# Managed by the salt_deploy formula.
+log:
+  level: info
+
+runner:
+  capacity: 1
+  labels:
+{% for label in forgejo.labels %}
+    - {{ label | json }}
+{% endfor %}
+
+host:
+  workdir_parent: {{ runner.work_dir | json }}
+
+server:
+  connections:
+    {{ forgejo.connection_name | json }}:
+      url: {{ forgejo.instance_url | json }}
+      uuid: {{ forgejo.uuid | json }}
+      token: {{ forgejo.token | json }}
+      labels:
+{% for label in forgejo.labels %}
+        - {{ label | json }}
+{% endfor %}

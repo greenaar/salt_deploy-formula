@@ -1,0 +1,25 @@
+name: Deploy Salt states
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: salt-master-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, linux, salt-deploy]
+    timeout-minutes: 10
+
+    steps:
+      - name: Promote pushed revision
+        env:
+          DEPLOY_SHA: ${{ github.sha }}
+        run: sudo /usr/local/sbin/deploy-salt "$DEPLOY_SHA"
+
