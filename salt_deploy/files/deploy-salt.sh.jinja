@@ -9,6 +9,19 @@
 {{ raise('salt_deploy:deploy:post_deploy:states entries must be non-empty strings') }}
 {% endif %}
 {% endfor %}
+{#- The promotion writes a symlink whose target is relative (`releases/<sha>`)
+    and stages it as `<base_dir>/.current.<sha>` before renaming it over
+    current_link. Both depend on current_link being a direct child of
+    base_dir: elsewhere the relative target resolves against the wrong
+    directory, and the rename stops being atomic as soon as the two are on
+    different filesystems. Neither failure is visible until the master serves
+    an empty file_roots, so refuse to render instead. #}
+{% if deploy.current_link.rsplit('/', 1)[0] != deploy.base_dir.rstrip('/') %}
+{{ raise('salt_deploy:deploy:current_link (' ~ deploy.current_link ~ ') must be a file directly inside salt_deploy:deploy:base_dir (' ~ deploy.base_dir ~ ')') }}
+{% endif %}
+{% if not deploy.releases_dir.startswith(deploy.base_dir.rstrip('/') ~ '/') %}
+{{ raise('salt_deploy:deploy:releases_dir (' ~ deploy.releases_dir ~ ') must be inside salt_deploy:deploy:base_dir (' ~ deploy.base_dir ~ ')') }}
+{% endif %}
 set -Eeuo pipefail
 umask 022
 
@@ -30,6 +43,12 @@ readonly -a POST_DEPLOY_STATES=(
     {{ state_name | json }}
 {% endfor %}
 )
+# The count comes from the template rather than from bash's array-length
+# expansion. That syntax opens with a dollar sign, a brace and a hash, and
+# those last two characters are Jinja's comment-open delimiter: written out
+# literally it starts a comment that never ends, and the whole file fails to
+# render. Do not reintroduce it, in code or in a comment.
+readonly POST_DEPLOY_STATE_COUNT={{ post_states | length }}
 
 usage() {
     echo "usage: $0 COMMIT_SHA | --latest" >&2
@@ -45,9 +64,19 @@ flock -n 9 || {
     exit 75
 }
 
-export GIT_SSH_COMMAND="/usr/bin/ssh -i $PRIVATE_KEY -o IdentitiesOnly=yes -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes"
+# Git re-parses this as a shell command, so the paths are quoted for that
+# second parse rather than only for this one.
+export GIT_SSH_COMMAND="/usr/bin/ssh -i '$PRIVATE_KEY' -o IdentitiesOnly=yes -o UserKnownHostsFile='$KNOWN_HOSTS' -o StrictHostKeyChecking=yes"
 
 mkdir -p -- "$BASE" "$RELEASES"
+
+# A staging directory is removed by an EXIT trap, which does not run if the
+# process is killed. Those leftovers are excluded from release pruning below,
+# so without this they accumulate in $RELEASES for the life of the host, each
+# holding a full copy of the state tree. Anything older than a day cannot
+# belong to a live run: this script holds an exclusive lock throughout.
+find "$RELEASES" -mindepth 1 -maxdepth 1 -type d -name '.staging.*' -mtime +0 \
+    -exec rm -rf -- {} +
 
 if [[ ! -d "$MIRROR" ]]; then
     git clone --quiet --mirror "$REPOSITORY_URL" "$MIRROR"
@@ -138,7 +167,7 @@ if [[ -n "$previous_target" ]]; then
         echo "Applying master state: $state_name"
         salt-call state.apply "$state_name" saltenv="$SALTENV" || post_deploy_failure
     done
-elif [[ "$POST_DEPLOY_SYNC_ALL" == true || ${#POST_DEPLOY_STATES[@]} -gt 0 ]]; then
+elif [[ "$POST_DEPLOY_SYNC_ALL" == true || "$POST_DEPLOY_STATE_COUNT" -gt 0 ]]; then
     echo "Skipping post-deployment actions during initial bootstrap"
 fi
 

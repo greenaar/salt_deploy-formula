@@ -4,6 +4,14 @@ salt_deploy_supported_platform:
   test.check_pillar:
     - present:
       - salt_deploy:deploy:repository_url
+      {#- The deploy key and host keys are consumed by deploy.sls through
+          contents_pillar. Unset, the first failure is either a file.managed
+          rendering error or - worse - an empty known_hosts, which makes the
+          initial clone fail host-key verification with a message that says
+          nothing about pillar. Both key names are configurable, so check the
+          names actually in use. #}
+      - {{ salt_deploy.deploy.private_key_pillar }}
+      - {{ salt_deploy.deploy.known_hosts_pillar }}
 {% if salt_deploy.runner.provider == 'github' %}
       - salt_deploy:runner:github:repository_url
 {% elif salt_deploy.runner.provider == 'forgejo' %}

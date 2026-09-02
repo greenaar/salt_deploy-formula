@@ -34,12 +34,39 @@ salt_deploy_github_runner_archive:
       - pkg: salt_deploy_packages
       - file: salt_deploy_runner_directories
 
+{#- The registration token is written to a root-owned file and read back by
+    the command, rather than interpolated into it.
+
+    `hide_output` suppresses the command's stdout and stderr, but not the
+    command itself: a cmd.run's `name` is part of the state return, and the
+    state return is written to the master job cache. On a master configured
+    for Alcali that cache is a database several people can read, and the
+    token is a credential that registers a runner against the repository.
+
+    The file is left in place afterwards. The token is single-use and
+    short-lived, `unless` keeps this state from running again once .runner
+    exists, and deleting it would make a legitimate re-registration
+    (--replace) need a fresh token for no security gain. #}
+{%- if github.registration_token %}
+salt_deploy_github_registration_token:
+  file.managed:
+    - name: {{ salt_deploy.deploy.config_dir }}/github-registration-token
+    - contents_pillar: salt_deploy:runner:github:registration_token
+    - user: {{ runner.user }}
+    - group: {{ runner.group }}
+    - mode: '0400'
+    - show_changes: false
+    - require:
+      - file: salt_deploy_directories
+      - user: salt_deploy_runner_user
+{%- endif %}
+
 salt_deploy_github_runner_configured:
   cmd.run:
     - name: >-
         ./config.sh --unattended
         --url {{ github.repository_url | json }}
-        --token {{ github.registration_token | json }}
+        --token "$(cat {{ (salt_deploy.deploy.config_dir ~ '/github-registration-token') | json }})"
         --name {{ runner.name | json }}
         --labels {{ github.labels | join(',') | json }}
         --work {{ runner.work_dir | json }}
@@ -51,6 +78,9 @@ salt_deploy_github_runner_configured:
     - hide_output: true
     - require:
       - cmd: salt_deploy_github_runner_dependencies
+      {%- if github.registration_token %}
+      - file: salt_deploy_github_registration_token
+      {%- endif %}
 
 salt_deploy_github_runner_dependencies:
   cmd.run:
