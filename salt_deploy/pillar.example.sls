@@ -4,37 +4,56 @@ salt_deploy:
     repository_url: git@github.com:example/salt-states.git
     branch: main
 
+    # The Git working tree the master already serves. salt_deploy updates
+    # this checkout in place; it does not create it, and it does not change
+    # any master path. Whatever else points at this directory - an NFS
+    # export, a Samba share, a backup job - keeps working.
+    work_tree: /srv/salt
+    owner: salt
+    group: salt
+
     # Store these values in encrypted pillar or another protected pillar source.
     private_key: |
       -----BEGIN OPENSSH PRIVATE KEY-----
-      REPLACE_WITH_A_READ_ONLY_GITHUB_DEPLOY_KEY
+      REPLACE_WITH_A_READ_ONLY_DEPLOY_KEY
       -----END OPENSSH PRIVATE KEY-----
 
-    # Obtain the current trusted github.com host keys through a separately
-    # authenticated channel. Do not populate this with an unauthenticated
-    # ssh-keyscan performed during deployment.
+    # Obtain the current trusted host keys through a separately authenticated
+    # channel. Do not populate this with an unauthenticated ssh-keyscan
+    # performed during deployment.
+    #
+    # A forge on a non-default SSH port needs the bracketed form, matching
+    # the port in repository_url:
+    #   [forge.example.com]:2222 ssh-ed25519 AAAA...
     known_hosts: |
-      github.com REPLACE_WITH_TRUSTED_GITHUB_HOST_KEY
+      github.com REPLACE_WITH_TRUSTED_HOST_KEY
 
+    # Runs as root inside a throwaway export of the requested commit, before
+    # the working tree is touched. The default assumes the top file sits at
+    # the root of the repository; set it to where file_roots actually expects
+    # one. A repository whose file_roots are subdirectories needs, say,
+    # `test -f base/top.sls`.
     validation_command: test -f top.sls
-    retain_releases: 5
-    bootstrap: true
 
-    # Optional master-local actions after a successful promotion. These values
-    # are baked into the root-owned deployment script, not supplied by CI.
+    # Deploy over uncommitted changes in the working tree. Leave false when
+    # the tree is writable by anyone - a Samba share, an NFS export - because
+    # the checkout is a --force and would discard their work without asking.
+    allow_dirty: false
+
+    # Optional master-local actions after a successful deployment. These
+    # values are baked into the root-owned script, not supplied by CI.
     post_deploy:
       sync_all: false
       states: []
-      # Example:
+      # Example - note these are SLS names as Salt resolves them, so a state
+      # in formulas/salt/pass/ is `salt.pass`, not `salt_pass`:
       # states:
-      #   - salt_pass
+      #   - salt.pass
       #   - salt_deploy
 
   master:
-    manage_file_roots: true
-    config_file: /etc/salt/master.d/99-salt-deploy.conf
-    service: salt-master
     saltenv: base
+    verify_roots: true
 
   runner:
     # Select exactly one provider: github or forgejo.

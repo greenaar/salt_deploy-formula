@@ -13,12 +13,29 @@ ExecStart={{ forgejo.binary }} daemon -c {{ forgejo.config_file }}
 Restart=always
 RestartSec=5s
 
-# Host jobs are needed for the fixed sudo deployment command. Restrict the
-# paths the otherwise untrusted workflow process can modify.
+# Workflow scratch space is kept out of the system /tmp. This is the only
+# filesystem confinement the unit sets, and that is deliberate.
 PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths={{ runner.home }} {{ runner.work_dir }} {{ deploy.base_dir }} /var/cache/salt /var/log/salt /run/lock
+
+# There is no ProtectSystem= here on purpose. The job this runner exists to
+# run is `sudo {{ deploy.script }}`, and a sudo'd process stays inside the
+# unit's mount namespace: any path made read-only here is read-only for the
+# deployment too. With ProtectSystem=strict the checkout, the fileserver
+# cache and every post-deployment state that writes to /etc or installs a
+# package all fail - as permission errors that look like anything but a
+# sandbox. Confinement that has to be switched off to let the service work
+# is worse than none, because the next person reads it and believes it.
+#
+# The boundary that does hold is the one the sudoers rule draws: this account
+# is unprivileged and may run exactly one root command, whose behaviour is
+# baked in at render time and cannot be steered by the workflow. That is what
+# keeps a compromised workflow from becoming a compromised master, and it is
+# not weakened by anything above.
+#
+# If you do want the deployment confined, confine the deployment rather than
+# the runner: have the sudo'd script hand the work to a transient unit with
+# systemd-run, which leaves this namespace behind. That needs its own review
+# of what post_deploy states touch, so it is not the default.
 
 [Install]
 WantedBy=multi-user.target

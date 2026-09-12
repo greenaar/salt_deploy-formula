@@ -9,33 +9,26 @@
 {{ raise('salt_deploy:deploy:post_deploy:states entries must be non-empty strings') }}
 {% endif %}
 {% endfor %}
-{#- The promotion writes a symlink whose target is relative (`releases/<sha>`)
-    and stages it as `<base_dir>/.current.<sha>` before renaming it over
-    current_link. Both depend on current_link being a direct child of
-    base_dir: elsewhere the relative target resolves against the wrong
-    directory, and the rename stops being atomic as soon as the two are on
-    different filesystems. Neither failure is visible until the master serves
-    an empty file_roots, so refuse to render instead. #}
-{% if deploy.current_link.rsplit('/', 1)[0] != deploy.base_dir.rstrip('/') %}
-{{ raise('salt_deploy:deploy:current_link (' ~ deploy.current_link ~ ') must be a file directly inside salt_deploy:deploy:base_dir (' ~ deploy.base_dir ~ ')') }}
-{% endif %}
-{% if not deploy.releases_dir.startswith(deploy.base_dir.rstrip('/') ~ '/') %}
-{{ raise('salt_deploy:deploy:releases_dir (' ~ deploy.releases_dir ~ ') must be inside salt_deploy:deploy:base_dir (' ~ deploy.base_dir ~ ')') }}
+{% set work_tree = deploy.work_tree.rstrip('/') %}
+{#- The checkout below is `git checkout --force`, which discards anything in
+    its way. Pointed at / or at a relative path resolved against whatever
+    directory the runner happened to start in, that is not a deployment, it
+    is an accident with root privileges. Refuse to render instead. #}
+{% if not deploy.work_tree.startswith('/') or not work_tree %}
+{{ raise('salt_deploy:deploy:work_tree (' ~ deploy.work_tree ~ ') must be an absolute path, and cannot be /') }}
 {% endif %}
 set -Eeuo pipefail
 umask 022
 
 readonly REPOSITORY_URL={{ deploy.repository_url | json }}
 readonly BRANCH={{ deploy.branch | json }}
-readonly BASE={{ deploy.base_dir | json }}
-readonly MIRROR={{ deploy.mirror_dir | json }}
-readonly RELEASES={{ deploy.releases_dir | json }}
-readonly CURRENT={{ deploy.current_link | json }}
+readonly WORK_TREE={{ work_tree | json }}
+readonly OWNER={{ deploy.owner | json }}
 readonly LOCK_FILE={{ deploy.lock_file | json }}
 readonly PRIVATE_KEY={{ deploy.private_key_path | json }}
 readonly KNOWN_HOSTS={{ deploy.known_hosts_path | json }}
 readonly VALIDATION_COMMAND={{ deploy.validation_command | json }}
-readonly RETAIN_RELEASES={{ deploy.retain_releases | int }}
+readonly ALLOW_DIRTY={{ deploy.get('allow_dirty', false) | json }}
 readonly SALTENV={{ master.saltenv | json }}
 readonly POST_DEPLOY_SYNC_ALL={{ post_deploy.get('sync_all', false) | json }}
 readonly -a POST_DEPLOY_STATES=(
@@ -68,26 +61,61 @@ flock -n 9 || {
 # second parse rather than only for this one.
 export GIT_SSH_COMMAND="/usr/bin/ssh -i '$PRIVATE_KEY' -o IdentitiesOnly=yes -o UserKnownHostsFile='$KNOWN_HOSTS' -o StrictHostKeyChecking=yes"
 
-mkdir -p -- "$BASE" "$RELEASES"
+# Every Git command runs as the account that owns the served tree, not as
+# root. This script is invoked through sudo, and a root `git checkout` would
+# rewrite an exported, shared, backed-up directory with root-owned files -
+# and leave .git itself half root-owned, so the next non-root read fails.
+# Only the salt-run and salt-call calls further down need root.
+git_as_owner() {
+    runuser -u "$OWNER" -- env \
+        GIT_SSH_COMMAND="$GIT_SSH_COMMAND" \
+        GIT_TERMINAL_PROMPT=0 \
+        git -C "$WORK_TREE" "$@"
+}
 
-# A staging directory is removed by an EXIT trap, which does not run if the
-# process is killed. Those leftovers are excluded from release pruning below,
-# so without this they accumulate in $RELEASES for the life of the host, each
-# holding a full copy of the state tree. Anything older than a day cannot
-# belong to a live run: this script holds an exclusive lock throughout.
-find "$RELEASES" -mindepth 1 -maxdepth 1 -type d -name '.staging.*' -mtime +0 \
-    -exec rm -rf -- {} +
-
-if [[ ! -d "$MIRROR" ]]; then
-    git clone --quiet --mirror "$REPOSITORY_URL" "$MIRROR"
-else
-    git --git-dir="$MIRROR" remote set-url origin "$REPOSITORY_URL"
+if [[ ! -d "$WORK_TREE/.git" ]]; then
+    echo "$WORK_TREE is not a Git working tree" >&2
+    exit 72
 fi
 
-git --git-dir="$MIRROR" fetch --quiet --force origin \
+# git fetch writes new objects into .git/objects/. When the checkout was
+# created by root (the normal bootstrap) and $OWNER is an unprivileged
+# account, the objects directory is root-owned and the fetch fails with a
+# confusing "insufficient permission for adding an object" error. Catch it
+# here with a clear fix path instead.
+if ! runuser -u "$OWNER" -- test -w "$WORK_TREE/.git/objects" 2>/dev/null; then
+    echo "$OWNER cannot write to $WORK_TREE/.git/objects." >&2
+    echo "The checkout was probably cloned by root. Fix with:" >&2
+    echo "  chown -R $OWNER:$GROUP $WORK_TREE/.git" >&2
+    echo "(where $GROUP is the group $OWNER belongs to)" >&2
+    exit 72
+fi
+
+if git_as_owner remote get-url origin >/dev/null 2>&1; then
+    git_as_owner remote set-url origin "$REPOSITORY_URL"
+else
+    git_as_owner remote add origin "$REPOSITORY_URL"
+fi
+
+# `--untracked-files=normal` honours .gitignore, so ignored working data in
+# the tree - vendored sources, __pycache__ - is not mistaken for an edit.
+dirty=$(git_as_owner status --porcelain --untracked-files=normal)
+if [[ -n "$dirty" ]]; then
+    if [[ "$ALLOW_DIRTY" == true ]]; then
+        echo "Discarding local modifications (salt_deploy:deploy:allow_dirty is set):" >&2
+        printf '%s\n' "$dirty" >&2
+    else
+        echo "Refusing to deploy: $WORK_TREE has uncommitted changes." >&2
+        printf '%s\n' "$dirty" >&2
+        echo "Commit, revert, or set salt_deploy:deploy:allow_dirty to discard them." >&2
+        exit 65
+    fi
+fi
+
+git_as_owner fetch --quiet --force origin \
     "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH"
 
-remote_sha=$(git --git-dir="$MIRROR" rev-parse "refs/remotes/origin/$BRANCH")
+remote_sha=$(git_as_owner rev-parse "refs/remotes/origin/$BRANCH")
 
 if [[ "$requested" == "--latest" ]]; then
     sha=$remote_sha
@@ -97,100 +125,72 @@ else
     usage
 fi
 
+# A workflow that was queued behind a newer push would otherwise roll the
+# master back to the commit that triggered it.
 if [[ "$sha" != "$remote_sha" ]]; then
     echo "Requested $sha, but origin/$BRANCH is now $remote_sha" >&2
     exit 65
 fi
 
-release="$RELEASES/$sha"
+previous_sha=$(git_as_owner rev-parse HEAD)
 
-if [[ ! -d "$release" ]]; then
-    staging=$(mktemp -d "$RELEASES/.staging.XXXXXXXX")
+if [[ -z "$dirty" && "$previous_sha" == "$sha" ]]; then
+    echo "Already at $sha"
+    exit 0
+fi
 
+# Validation runs against a throwaway export, so a revision that fails it
+# never reaches the working tree at all. Checking out first and validating
+# afterwards would mean the master is already serving the bad tree by the
+# time the check reports it.
+if [[ -n "$VALIDATION_COMMAND" ]]; then
+    staging=$(mktemp -d)
     cleanup() {
         rm -rf -- "$staging"
     }
     trap cleanup EXIT
 
-    git --git-dir="$MIRROR" archive "$sha" | tar -x --directory="$staging"
+    git_as_owner archive "$sha" | tar -x --directory="$staging"
+    (cd "$staging" && /bin/bash -o pipefail -c "$VALIDATION_COMMAND")
 
-    if [[ -n "$VALIDATION_COMMAND" ]]; then
-        (cd "$staging" && /bin/bash -o pipefail -c "$VALIDATION_COMMAND")
-    fi
-
-    mv -- "$staging" "$release"
+    rm -rf -- "$staging"
     trap - EXIT
 fi
 
-previous_target=''
-if [[ -L "$CURRENT" ]]; then
-    previous_target=$(readlink "$CURRENT")
-elif [[ -e "$CURRENT" ]]; then
-    echo "$CURRENT exists and is not a symbolic link" >&2
-    exit 73
-fi
-
-new_link="$BASE/.current.$sha"
-rm -f -- "$new_link"
-ln -s "releases/$sha" "$new_link"
-mv -Tf -- "$new_link" "$CURRENT"
+# Stay on the branch rather than detaching. People browse and edit this tree
+# over Samba and NFS, and `git status` reporting a detached HEAD invites
+# someone to "fix" it. The requested commit has already been confirmed to be
+# this branch's head, so resetting the branch onto it is a fast-forward.
+git_as_owner checkout --quiet --force -B "$BRANCH" "$sha"
 
 if ! salt-run fileserver.clear_file_list_cache backend=roots; then
-    echo "Salt cache refresh failed; restoring the previous release" >&2
-    if [[ -n "$previous_target" ]]; then
-        rollback_link="$BASE/.current.rollback.$$"
-        ln -s "$previous_target" "$rollback_link"
-        mv -Tf -- "$rollback_link" "$CURRENT"
-        salt-run fileserver.clear_file_list_cache backend=roots || true
-    else
-        rm -f -- "$CURRENT"
-    fi
+    echo "Salt cache refresh failed; restoring $previous_sha" >&2
+    git_as_owner checkout --quiet --force -B "$BRANCH" "$previous_sha"
+    salt-run fileserver.clear_file_list_cache backend=roots || true
     exit 70
 fi
 
 post_deploy_failure() {
-    echo "Post-deployment actions failed for $sha; the promoted release remains active" >&2
-    logger -t salt-deploy "Post-deployment actions failed for Salt release $sha; release remains active"
+    echo "Post-deployment actions failed for $sha; the tree remains at $sha" >&2
+    logger -t salt-deploy "Post-deployment actions failed for Salt commit $sha; tree remains at $sha"
     exit 70
 }
 
-# The initial promotion can be running inside state.apply salt_deploy. Starting
-# another local state run there would contend with the active state lock, so
-# hooks intentionally begin with the next deployment.
-if [[ -n "$previous_target" ]]; then
-    if [[ "$POST_DEPLOY_SYNC_ALL" == true ]]; then
-        echo "Synchronizing Salt master extension modules"
-        salt-run saltutil.sync_all saltenv="$SALTENV" || post_deploy_failure
-    fi
+# Deliberately not rolled back. A state that has already run has changed the
+# system, and repointing the checkout would not undo it - it would only hide
+# which revision produced the change. Investigate, then roll back by hand.
+if [[ "$POST_DEPLOY_SYNC_ALL" == true ]]; then
+    echo "Synchronizing Salt master extension modules"
+    salt-run saltutil.sync_all saltenv="$SALTENV" || post_deploy_failure
+fi
 
+if (( POST_DEPLOY_STATE_COUNT > 0 )); then
     for state_name in "${POST_DEPLOY_STATES[@]}"; do
         echo "Applying master state: $state_name"
-        salt-call state.apply "$state_name" saltenv="$SALTENV" || post_deploy_failure
-    done
-elif [[ "$POST_DEPLOY_SYNC_ALL" == true || "$POST_DEPLOY_STATE_COUNT" -gt 0 ]]; then
-    echo "Skipping post-deployment actions during initial bootstrap"
-fi
-
-if (( RETAIN_RELEASES > 0 )); then
-    mapfile -d '' candidates < <(
-        find "$RELEASES" -mindepth 1 -maxdepth 1 -type d \
-            ! -name '.staging.*' -printf '%T@\t%p\0' | sort -zrn
-    )
-
-    retained=0
-    current_real=$(readlink -f "$CURRENT")
-    for candidate_record in "${candidates[@]}"; do
-        candidate=${candidate_record#*$'\t'}
-        if (( retained < RETAIN_RELEASES )) || [[ "$candidate" == "$current_real" ]]; then
-            ((retained += 1))
-            continue
-        fi
-        case "$candidate" in
-            "$RELEASES"/*) rm -rf -- "$candidate" ;;
-            *) echo "Refusing to prune unexpected path: $candidate" >&2; exit 70 ;;
-        esac
+        salt-call --retcode-passthrough state.apply "$state_name" saltenv="$SALTENV" \
+            || post_deploy_failure
     done
 fi
 
-logger -t salt-deploy "Promoted Salt release $sha"
-echo "Promoted Salt release $sha"
+logger -t salt-deploy "Deployed Salt commit $sha (was $previous_sha)"
+echo "Deployed Salt commit $sha (was $previous_sha)"

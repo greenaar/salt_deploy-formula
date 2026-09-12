@@ -8,10 +8,22 @@ salt_deploy:
   deploy:
     repository_url: ''
     branch: main
-    base_dir: /srv/salt-deploy
-    mirror_dir: /srv/salt-deploy/repo.git
-    releases_dir: /srv/salt-deploy/releases
-    current_link: /srv/salt-deploy/current
+
+    # The state tree the Salt master already serves, as a Git working tree.
+    #
+    # salt_deploy updates this checkout in place. It deliberately does not
+    # introduce a release directory of its own: file_roots, pillar_roots, the
+    # PillarStack ext_pillar and auth_dirs keep the paths they already have,
+    # and so does anything else pointed at this directory - an NFS export, a
+    # Samba share, a backup job. See README.md, "Why in place".
+    work_tree: /srv/salt
+
+    # Ownership of the served tree. Git runs as this account rather than as
+    # root, so a deployment never leaves root-owned files behind in a tree
+    # that is exported, shared, or read by a non-root master process.
+    owner: salt
+    group: salt
+
     script: /usr/local/sbin/deploy-salt
     lock_file: /run/lock/deploy-salt.lock
     config_dir: /etc/salt-deploy
@@ -19,18 +31,31 @@ salt_deploy:
     private_key_pillar: salt_deploy:deploy:private_key
     known_hosts_path: /etc/salt-deploy/known_hosts
     known_hosts_pillar: salt_deploy:deploy:known_hosts
+
+    # Run from inside a staged export of the requested commit, as root,
+    # before the working tree is touched. Set this to the check that proves
+    # a revision is servable - at minimum, that the top file is where
+    # file_roots expects it.
     validation_command: test -f top.sls
-    retain_releases: 5
-    bootstrap: true
+
+    # Refuse to deploy when the working tree has uncommitted changes.
+    # The tree is writable over Samba and NFS, so someone may be editing it;
+    # the checkout below is a --force, which would discard that silently.
+    allow_dirty: false
+
     post_deploy:
       sync_all: false
       states: []
 
   master:
-    manage_file_roots: true
-    config_file: /etc/salt/master.d/99-salt-deploy.conf
-    service: salt-master
     saltenv: base
+
+    # Before deploying, check that every master path the salt formula
+    # configures - file_roots, pillar_roots, the PillarStack ext_pillar and
+    # auth_dirs - resolves inside work_tree. A path left outside it is served
+    # from somewhere this formula does not update, which is silent: states
+    # deploy and the stale ones keep being served.
+    verify_roots: true
 
   runner:
     provider: github

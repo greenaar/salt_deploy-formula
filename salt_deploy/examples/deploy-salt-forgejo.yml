@@ -3,15 +3,25 @@ name: Deploy Salt states
 on:
   push:
     branches:
-      - main
+      - master
+
+concurrency:
+  group: salt-master-deploy
+  cancel-in-progress: false
 
 jobs:
   deploy:
+    # Matches the `salt-deploy:host` label the formula configures. The part
+    # before the colon is the label; `host` is the runner type, and is what
+    # lets this job invoke a command on the master itself.
     runs-on: salt-deploy
     timeout-minutes: 10
 
     steps:
       - name: Promote pushed revision
+        # Forgejo Actions provides the `github` context for compatibility.
+        # The command re-fetches the branch and verifies this SHA is still
+        # its head, so a delayed job cannot roll the master backwards.
         env:
-          DEPLOY_SHA: ${{ forgejo.sha }}
+          DEPLOY_SHA: ${{ github.sha }}
         run: sudo /usr/local/sbin/deploy-salt "$DEPLOY_SHA"
